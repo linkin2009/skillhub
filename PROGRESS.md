@@ -32,7 +32,10 @@
 - [x] 技能详情弹窗（描述/topics/全指标/安装）
 - [x] **中文翻译**：1806 条描述经 16 个 haiku agent 并行翻译 → `data/translations.json`；
       scraper `apply_translations` 持久化，ZH 模式显示中文、EN 回退英文。新增技能重跑翻译 workflow 即可补全。
-- [ ] 个体 SKILL.md 粒度索引（需 code search + token，放 Actions）
+- [x] **个体 SKILL.md 粒度索引（真·1:1）**：`scraper/build_skills.py` 用 code search 找
+      SKILL.md → 并行抓取 + 解析 frontmatter name/description → 技能级条目（1799 技能，
+      claude-skill-registry 一仓拆出 242 个）。已替代仓库级成为主数据。
+- [x] 已上线 https://linkin2009.github.io/skillhub/ （Pages branch 部署，push 自动重建）
 - [ ] 热点 sparkline（需快照积累几天）
 - [ ] 全文搜索索引（minisearch）
 - [ ] 绑定域名
