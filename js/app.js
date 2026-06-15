@@ -27,13 +27,18 @@
 
   // ---------- data ----------
   async function loadData() {
-    var f = function (p) { return fetch(DATA + p).then(function (r) { return r.json(); }).catch(function () { return null; }); };
-    var r = await Promise.all([f("skills.json"), f("meta.json"), f("collections.json"), f("treasure.json"), f("daily.json")]);
+    // meta is tiny — fetch it fresh (no-store) to learn the current build version,
+    // then version-bust the big files so new builds always load, repeats stay cached.
+    var meta = await fetch(DATA + "meta.json", { cache: "no-store" })
+      .then(function (r) { return r.json(); }).catch(function () { return null; });
+    var v = "?v=" + encodeURIComponent((meta && meta.updated_at) || "0");
+    var f = function (p) { return fetch(DATA + p + v).then(function (r) { return r.json(); }).catch(function () { return null; }); };
+    var r = await Promise.all([f("skills.json"), f("collections.json"), f("treasure.json"), f("daily.json")]);
     state.skills = r[0] || [];
-    state.meta = r[1] || { categories: {}, total_skills: state.skills.length, total_stars: 0 };
-    state.collections = r[2] || [];
-    state.treasure = r[3] || [];
-    state.daily = r[4] || {};
+    state.meta = meta || { categories: {}, total_skills: state.skills.length, total_stars: 0 };
+    state.collections = r[1] || [];
+    state.treasure = r[2] || [];
+    state.daily = r[3] || {};
     state.byId = {};
     state.skills.forEach(function (s) { state.byId[s.id] = s; });
   }
