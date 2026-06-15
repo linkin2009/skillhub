@@ -22,49 +22,82 @@ TOKEN = bd.TOKEN
 API = bd.API
 UA = bd.UA
 MAX_FILES = int(os.environ.get("SKILL_MAX", "1800"))
+THROTTLE = float(os.environ.get("SKILL_THROTTLE", "4.0"))  # stay well under 30/min
+TIME_BUDGET = int(os.environ.get("SKILL_BUDGET", "1080"))  # max seconds spent searching
+MIN_SPLIT = 48  # don't bisect size ranges narrower than this
+BASE_Q = "filename:SKILL.md"
+_t0 = [0.0]
 
-CODE_QUERIES = [
-    "filename:SKILL.md",
-    "path:skills filename:SKILL.md",
-    "path:.claude/skills filename:SKILL.md",
-    "path:.claude filename:SKILL.md",
-]
+
+def _add(seen, items):
+    for it in items:
+        hu = it.get("html_url")
+        if not hu or hu in seen:
+            continue
+        repo = it.get("repository") or {}
+        owner = repo.get("owner") or {}
+        seen[hu] = {"html_url": hu, "repo": repo.get("full_name", ""),
+                    "path": it.get("path", ""), "owner": owner.get("login", ""),
+                    "avatar": owner.get("avatar_url", "")}
+
+
+def search_req(url):
+    """Code-search GET with secondary-rate-limit backoff (403/429 -> wait)."""
+    for attempt in range(6):
+        try:
+            data, _ = bd.req(url)
+            time.sleep(THROTTLE)
+            return data
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):
+                ra = e.headers.get("Retry-After")
+                wait = int(ra) if (ra and str(ra).isdigit()) else 60
+                print(f"  rate-limited ({e.code}); sleeping {wait}s", file=sys.stderr, flush=True)
+                time.sleep(wait)
+                continue
+            print(f"  ! HTTP {e.code}", file=sys.stderr, flush=True)
+            return None
+        except Exception:
+            time.sleep(5)
+    return None
+
+
+def search_count(q):
+    d = search_req(f"{API}/search/code?q={urllib.parse.quote(q)}&per_page=1")
+    return d.get("total_count", -1) if d else -1
+
+
+def collect_query(q, seen):
+    for page in range(1, 11):  # 1000 results max per query
+        d = search_req(f"{API}/search/code?q={urllib.parse.quote(q)}&per_page=100&page={page}")
+        if not d:
+            break
+        items = d.get("items", [])
+        if not items:
+            break
+        _add(seen, items)
+        if len(items) < 100 or len(seen) >= MAX_FILES:
+            break
 
 
 def code_search():
+    """Bisect on file size to escape the 1000-results-per-query cap."""
+    _t0[0] = time.time()
     seen = {}
-    for q in CODE_QUERIES:
-        for page in range(1, 11):  # max 1000 results / query
-            url = f"{API}/search/code?q={urllib.parse.quote(q)}&per_page=100&page={page}"
-            try:
-                data, _ = bd.req(url)
-            except urllib.error.HTTPError as e:
-                print(f"  ! code search {e.code} on '{q}' p{page}", file=sys.stderr)
-                time.sleep(5)
-                break
-            except Exception as e:
-                print(f"  ! {e}", file=sys.stderr)
-                break
-            items = data.get("items", [])
-            if not items:
-                break
-            for it in items:
-                hu = it.get("html_url")
-                if not hu or hu in seen:
-                    continue
-                repo = it.get("repository") or {}
-                owner = repo.get("owner") or {}
-                seen[hu] = {
-                    "html_url": hu, "repo": repo.get("full_name", ""),
-                    "path": it.get("path", ""), "owner": owner.get("login", ""),
-                    "avatar": owner.get("avatar_url", ""),
-                }
-            time.sleep(2.5)  # authenticated search ~30/min
-            if len(items) < 100 or len(seen) >= MAX_FILES:
-                break
-        print(f"  code '{q}': total unique {len(seen)}")
-        if len(seen) >= MAX_FILES:
-            break
+    stack = [(0, 100000)]
+    while stack and len(seen) < MAX_FILES and (time.time() - _t0[0]) < TIME_BUDGET:
+        lo, hi = stack.pop()
+        cnt = search_count(f"{BASE_Q} size:{lo}..{hi}")
+        if cnt == 0:
+            continue
+        if cnt < 0 or cnt <= 1000 or (hi - lo) <= MIN_SPLIT:
+            collect_query(f"{BASE_Q} size:{lo}..{hi}", seen)
+            print(f"  size {lo}..{hi}: cnt={cnt} -> unique={len(seen)}", flush=True)
+        else:
+            mid = (lo + hi) // 2
+            stack.append((mid + 1, hi))
+            stack.append((lo, mid))  # denser small-size buckets first
+    print(f"  [code_search] {len(seen)} files in {int(time.time()-_t0[0])}s", flush=True)
     return list(seen.values())[:MAX_FILES]
 
 
@@ -74,14 +107,32 @@ def parse_frontmatter(text):
     end = text.find("\n---", 3)
     if end < 0:
         return None, None
+    lines = text[3:end].splitlines()
     name = desc = None
-    for line in text[3:end].splitlines():
-        s = line.strip()
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
         low = s.lower()
         if name is None and low.startswith("name:"):
             name = s.split(":", 1)[1].strip().strip("\"'")
         elif desc is None and low.startswith("description:"):
-            desc = s.split(":", 1)[1].strip().strip("\"'")
+            val = s.split(":", 1)[1].strip()
+            if val in ("", ">", ">-", ">+", "|", "|-", "|+"):
+                # YAML block scalar: gather the following more-indented lines
+                base = len(lines[i]) - len(lines[i].lstrip())
+                block, j = [], i + 1
+                while j < len(lines):
+                    ln = lines[j]
+                    if ln.strip() == "":
+                        block.append(""); j += 1; continue
+                    if (len(ln) - len(ln.lstrip())) > base:
+                        block.append(ln.strip()); j += 1
+                    else:
+                        break
+                desc = " ".join(x for x in block if x).strip()
+            else:
+                desc = val.strip("\"'")
+        i += 1
         if name and desc:
             break
     return name, desc
@@ -100,18 +151,49 @@ def fetch_raw(item):
     return item
 
 
-def fetch_repo_meta(full):
-    try:
-        d, _ = bd.req(f"{API}/repos/{full}")
-        return full, {
-            "stars": d.get("stargazers_count", 0), "forks": d.get("forks_count", 0),
-            "topics": (d.get("topics") or [])[:8],
-            "license": (d.get("license") or {}).get("spdx_id") or "" if d.get("license") else "",
-            "pushed_at": d.get("pushed_at") or "", "created_at": d.get("created_at") or "",
-            "language": d.get("language") or "",
-        }
-    except Exception:
-        return full, {}
+def graphql_repo_meta(repos):
+    """Fetch stars/topics/etc for many repos via batched GraphQL (~80/call)."""
+    out = {}
+    B = 80
+    for i in range(0, len(repos), B):
+        batch = repos[i:i + B]
+        parts = []
+        for j, full in enumerate(batch):
+            if "/" not in full:
+                continue
+            o, n = full.split("/", 1)
+            o = o.replace("\\", "").replace('"', '')
+            n = n.replace("\\", "").replace('"', '')
+            parts.append(f'r{j}: repository(owner:"{o}", name:"{n}"){{stargazerCount forkCount '
+                         f'pushedAt createdAt primaryLanguage{{name}} licenseInfo{{spdxId}} '
+                         f'repositoryTopics(first:8){{nodes{{topic{{name}}}}}}}}')
+        query = "query{" + " ".join(parts) + "}"
+        body = json.dumps({"query": query}).encode()
+        try:
+            r = urllib.request.Request("https://api.github.com/graphql", data=body,
+                headers={"User-Agent": UA, "Authorization": "Bearer " + TOKEN,
+                         "Content-Type": "application/json"})
+            with urllib.request.urlopen(r, timeout=45) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            data = d.get("data") or {}
+            for j, full in enumerate(batch):
+                node = data.get(f"r{j}")
+                if not node:
+                    continue
+                out[full] = {
+                    "stars": node.get("stargazerCount", 0), "forks": node.get("forkCount", 0),
+                    "pushed_at": node.get("pushedAt") or "", "created_at": node.get("createdAt") or "",
+                    "language": (node.get("primaryLanguage") or {}).get("name") or "",
+                    "license": (node.get("licenseInfo") or {}).get("spdxId") or "",
+                    "topics": [t["topic"]["name"] for t in
+                               ((node.get("repositoryTopics") or {}).get("nodes") or [])][:8],
+                }
+        except Exception as e:
+            print(f"  ! graphql batch {i//B} err: {e}", file=sys.stderr)
+        time.sleep(0.4)
+        if (i // B) % 10 == 0:
+            print(f"  graphql meta: {len(out)}/{len(repos)}")
+    return out
 
 
 def dirname_of(path):
@@ -130,16 +212,13 @@ def main():
     found = code_search()
     print(f"[skills] {len(found)} SKILL.md files found; fetching content...")
 
-    with cf.ThreadPoolExecutor(max_workers=24) as ex:
+    with cf.ThreadPoolExecutor(max_workers=32) as ex:
         found = list(ex.map(fetch_raw, found))
 
-    # unique repos -> star metadata
+    # unique repos -> star metadata (bulk GraphQL)
     repos = sorted({f["repo"] for f in found if f["repo"]})
-    print(f"[skills] fetching metadata for {len(repos)} repos...")
-    meta = {}
-    with cf.ThreadPoolExecutor(max_workers=8) as ex:
-        for full, m in ex.map(fetch_repo_meta, repos):
-            meta[full] = m
+    print(f"[skills] GraphQL metadata for {len(repos)} repos...")
+    meta = graphql_repo_meta(repos)
 
     records = []
     for f in found:
@@ -172,7 +251,19 @@ def main():
         if not r["name"] and not r["description"]:
             continue
         seen_ids[r["id"]] = r
-    records = list(seen_ids.values())
+
+    # incremental: union with previously indexed skills so re-runs accumulate
+    existing = {}
+    sp = os.path.join(DATA, "skills.json")
+    if os.environ.get("SKILL_FRESH") != "1" and os.path.exists(sp):
+        try:
+            for r in json.load(open(sp)):
+                existing[r["id"]] = r
+        except Exception:
+            pass
+    existing.update(seen_ids)  # new data wins
+    records = list(existing.values())
+    print(f"[skills] {len(seen_ids)} this run; merged total {len(records)}")
 
     for r in records:
         bd.add_tier(r)

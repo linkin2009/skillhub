@@ -54,6 +54,9 @@ def main():
 
     todo = [(s["id"], s["description"]) for s in skills
             if (s.get("description") or "").strip() and s["id"] not in tr]
+    mt_max = int(os.environ.get("MT_MAX", "0"))  # 0 = no cap; else top-N (star-sorted)
+    if mt_max > 0:
+        todo = todo[:mt_max]
     print(f"[mt] cached={len(tr)} to_translate={len(todo)}")
 
     def work(item):

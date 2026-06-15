@@ -57,6 +57,26 @@
     });
   }
 
+  function diversifyByRepo(list) {
+    // round-robin by repo so one big repo can't monopolize the first screens
+    var groups = {}, order = [];
+    for (var i = 0; i < list.length; i++) {
+      var k = list[i].repo || list[i].id;
+      if (!groups[k]) { groups[k] = []; order.push(k); }
+      groups[k].push(list[i]);
+    }
+    var out = [], round = 0, added = true;
+    while (added) {
+      added = false;
+      for (var j = 0; j < order.length; j++) {
+        var g = groups[order[j]];
+        if (g.length > round) { out.push(g[round]); added = true; }
+      }
+      round++;
+    }
+    return out;
+  }
+
   function getFiltered() {
     var list = state.skills.slice();
     if (state.category !== "all") list = list.filter(function (s) { return s.category === state.category; });
@@ -74,6 +94,7 @@
       new: function (a, b) { return (b.created_at || "").localeCompare(a.created_at || ""); },
     };
     list.sort(by[state.sort] || by.recommend);
+    if (state.sort === "recommend") list = diversifyByRepo(list);
     return list;
   }
 
