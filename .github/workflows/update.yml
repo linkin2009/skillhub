@@ -1,0 +1,46 @@
+name: Daily update
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # daily ~03:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # commit refreshed data back to main
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Grow + fix + translate + apply
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPAND_MAX: "3000"   # modest daily growth (caps at available candidates)
+          MT_MAX: "6000"
+        run: |
+          python3 scraper/expand_skills.py || true
+          python3 scraper/refix_desc.py || true
+          python3 scraper/translate_mt.py || true
+          USE_CACHE=1 python3 scraper/build_data.py || true
+          python3 - <<'PY'
+          import json
+          d = json.load(open("data/skills.json")); m = json.load(open("data/meta.json"))
+          m["total_stars"] = sum({r["repo"]: r.get("stars", 0) for r in d}.values())
+          m["granularity"] = "skill"
+          json.dump(m, open("data/meta.json", "w"), ensure_ascii=False)
+          print(f"{len(d)} skills, {sum(1 for s in d if s.get('desc_zh'))} zh")
+          PY
+
+      - name: Commit refreshed data (Pages auto-rebuilds from branch)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          git commit -m "data: daily auto-update $(date -u +%F)" || echo "no changes"
+          git push
